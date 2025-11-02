@@ -7,6 +7,14 @@ import json
 from characters import CHARACTERS
 from utils import count_tokens, format_cost, save_chat_history, load_chat_history, get_character_avatar
 
+# 尝试导入MCP搜索模块（向后兼容：如果导入失败，禁用MCP功能）
+try:
+    from mcp_search import MCPChatManager
+    MCP_AVAILABLE = True
+except ImportError as e:
+    print(f"MCP模块未安装: {e}")
+    MCP_AVAILABLE = False
+
 st.set_page_config(
     page_title="角色扮演聊天机器人",
     page_icon="🎭",
@@ -154,6 +162,14 @@ def init_session_state():
             st.error("请设置 OPENAI_API_KEY 和 OPENAI_BASE_URL 环境变量")
             st.stop()
         st.session_state.client = OpenAI(api_key=api_key, base_url=base_url)
+    
+    # MCP搜索相关状态
+    if 'mcp_manager' not in st.session_state and MCP_AVAILABLE:
+        st.session_state.mcp_manager = MCPChatManager(st.session_state.client)
+    if 'enable_mcp_search' not in st.session_state:
+        st.session_state.enable_mcp_search = MCP_AVAILABLE  # 默认启用（如果可用）
+    if 'search_history' not in st.session_state:
+        st.session_state.search_history = []  # 记录搜索历史
 
 def switch_character(character_name):
     if st.session_state.current_character != character_name:
@@ -184,43 +200,89 @@ def get_system_prompt(character_name):
 8. 展现角色的专业知识和独特视角"""
 
 def chat_with_character(user_message):
+    """对话函数 - 支持MCP搜索增强（向后兼容）"""
     character = CHARACTERS[st.session_state.current_character]
     
-    messages = [
-        {"role": "system", "content": get_system_prompt(st.session_state.current_character)}
-    ]
-    
-    for msg in st.session_state.messages:
-        messages.append({"role": msg["role"], "content": msg["content"]})
-    
-    messages.append({"role": "user", "content": user_message})
-    
-    try:
-        response = st.session_state.client.chat.completions.create(
+    # 如果MCP可用且启用，使用MCP增强对话
+    if MCP_AVAILABLE and st.session_state.enable_mcp_search and 'mcp_manager' in st.session_state:
+        result = st.session_state.mcp_manager.chat_with_mcp(
+            user_message=user_message,
+            character=character,
+            system_prompt=get_system_prompt(st.session_state.current_character),
+            conversation_history=st.session_state.messages,
+            enable_search=True,
             model="gpt-4o-ca",
-            messages=messages,
             temperature=0.8,
             max_tokens=2000
         )
         
-        assistant_message = response.choices[0].message.content
-        tokens_used = response.usage.total_tokens
+        # 更新会话状态
+        if result['response']:
+            st.session_state.total_tokens += result['tokens_used']
+            st.session_state.total_cost += result['cost']
+            
+            st.session_state.messages.append({
+                "role": "user", 
+                "content": user_message
+            })
+            st.session_state.messages.append({
+                "role": "assistant", 
+                "content": result['response']
+            })
+            
+            # 记录搜索历史
+            if result['search_performed']:
+                st.session_state.search_history.append({
+                    'query': result['search_query'],
+                    'summary': result['search_summary'],
+                    'user_question': user_message,
+                    'results': result.get('search_results', [])
+                })
         
-        prompt_tokens = response.usage.prompt_tokens
-        completion_tokens = response.usage.completion_tokens
-        cost = (prompt_tokens * 0.000005 + completion_tokens * 0.000015)
+        return (result['response'], 
+                result['tokens_used'], 
+                result['cost'],
+                result['search_performed'],
+                result['search_query'],
+                result.get('search_results', []))
+    
+    # 降级方案：使用原始对话逻辑（不使用MCP）
+    else:
+        messages = [
+            {"role": "system", "content": get_system_prompt(st.session_state.current_character)}
+        ]
         
-        st.session_state.total_tokens += tokens_used
-        st.session_state.total_cost += cost
+        for msg in st.session_state.messages:
+            messages.append({"role": msg["role"], "content": msg["content"]})
         
-        st.session_state.messages.append({"role": "user", "content": user_message})
-        st.session_state.messages.append({"role": "assistant", "content": assistant_message})
+        messages.append({"role": "user", "content": user_message})
         
-        return assistant_message, tokens_used, cost
-        
-    except Exception as e:
-        st.error(f"API调用失败: {str(e)}")
-        return None, 0, 0.0
+        try:
+            response = st.session_state.client.chat.completions.create(
+                model="gpt-4o-ca",
+                messages=messages,
+                temperature=0.8,
+                max_tokens=2000
+            )
+            
+            assistant_message = response.choices[0].message.content
+            tokens_used = response.usage.total_tokens
+            
+            prompt_tokens = response.usage.prompt_tokens
+            completion_tokens = response.usage.completion_tokens
+            cost = (prompt_tokens * 0.000005 + completion_tokens * 0.000015)
+            
+            st.session_state.total_tokens += tokens_used
+            st.session_state.total_cost += cost
+            
+            st.session_state.messages.append({"role": "user", "content": user_message})
+            st.session_state.messages.append({"role": "assistant", "content": assistant_message})
+            
+            return assistant_message, tokens_used, cost, False, "", []
+            
+        except Exception as e:
+            st.error(f"API调用失败: {str(e)}")
+            return None, 0, 0.0, False, "", []
 
 def main():
     init_session_state()
@@ -250,9 +312,54 @@ def main():
         
         st.divider()
         
+        # MCP搜索增强控制
+        if MCP_AVAILABLE:
+            st.subheader("🔍 MCP搜索增强")
+            
+            # 状态指示器
+            if st.session_state.enable_mcp_search:
+                st.success("✅ MCP已启用 - 智能搜索运行中")
+            else:
+                st.warning("⏸️ MCP已暂停 - 使用标准对话模式")
+            
+            st.session_state.enable_mcp_search = st.checkbox(
+                "启用智能搜索增强",
+                value=st.session_state.enable_mcp_search,
+                help="AI会自动判断是否需要搜索网络资料来增强回答"
+            )
+            
+            # 显示搜索历史
+            if st.session_state.search_history:
+                with st.expander(f"📋 搜索历史 ({len(st.session_state.search_history)})"):
+                    for i, search in enumerate(reversed(st.session_state.search_history[-5:])):
+                        st.caption(f"**Q{len(st.session_state.search_history)-i}:** {search['user_question'][:40]}...")
+                        st.caption(f"🔍 关键词: {search['query']}")
+                        # 直接显示搜索结果，不使用嵌套expander
+                        with st.container():
+                            st.markdown(f"**摘要：** {search['summary'][:150]}...")
+                            if search.get('results'):
+                                st.markdown("**来源：**")
+                                for j, res in enumerate(search['results'][:3]):
+                                    st.markdown(f"  {j+1}. [{res['title']}]({res['url']})")
+                        if i < min(4, len(st.session_state.search_history)-1):
+                            st.divider()
+        else:
+            st.info("💡 提示：安装搜索依赖可启用MCP增强\n```\npip install duckduckgo-search beautifulsoup4 requests\n```")
+        
+        st.divider()
+        
         st.subheader("📊 使用统计")
-        st.metric("总Token消耗", f"{st.session_state.total_tokens:,}")
-        st.metric("预估费用", f"${st.session_state.total_cost:.6f}")
+        col1, col2 = st.columns(2)
+        with col1:
+            st.metric("总Token消耗", f"{st.session_state.total_tokens:,}")
+        with col2:
+            st.metric("预估费用", f"${st.session_state.total_cost:.6f}")
+        
+        # MCP搜索统计
+        if MCP_AVAILABLE and st.session_state.search_history:
+            search_count = len(st.session_state.search_history)
+            st.metric("🔍 MCP搜索次数", f"{search_count}", 
+                     help="本次会话中AI触发网络搜索的次数")
         
         st.divider()
         
@@ -285,6 +392,13 @@ def main():
         character = CHARACTERS[st.session_state.current_character]
         
         avatar_url = get_character_avatar(st.session_state.current_character, character)
+        
+        # MCP状态横幅
+        if MCP_AVAILABLE:
+            if st.session_state.enable_mcp_search:
+                st.success("✅ **MCP智能搜索增强已启用** - AI会在需要时自动搜索网络资料来提供更准确的答案", icon="🔍")
+            else:
+                st.info("ℹ️ MCP搜索增强已禁用 - 当前使用标准对话模式", icon="💬")
         
         col_header1, col_header2 = st.columns([1, 9])
         with col_header1:
@@ -323,10 +437,34 @@ def main():
             
             with st.chat_message("assistant", avatar=avatar_url):
                 with st.spinner(f"{character['name']}正在思考..."):
-                    response, tokens, cost = chat_with_character(user_input)
+                    # 根据MCP是否可用，解包不同数量的返回值
+                    result = chat_with_character(user_input)
+                    
+                    if MCP_AVAILABLE and len(result) == 6:
+                        response, tokens, cost, searched, search_query, search_results = result
+                    else:
+                        response, tokens, cost = result[:3]
+                        searched, search_query, search_results = False, "", []
+                    
                     if response:
                         st.markdown(response)
-                        st.caption(f"💰 本次消耗: {tokens} tokens (${cost:.6f})")
+                        
+                        # 显示搜索信息 - 更加醒目的标记
+                        if searched and search_query:
+                            st.info(f"🔍 **MCP搜索增强已应用** | 搜索关键词：「{search_query}」")
+                            with st.expander("📚 查看搜索来源和摘要"):
+                                st.caption("💡 AI自动判断此问题需要网络搜索来提供更准确的答案")
+                                if search_results:
+                                    st.markdown("**📖 参考来源：**")
+                                    for i, res in enumerate(search_results[:3]):
+                                        st.markdown(f"{i+1}. [{res['title']}]({res['url']})")
+                                        st.caption(f"   ↳ {res['snippet'][:100]}...")
+                        
+                        # 显示Token消耗，带搜索标记
+                        if searched:
+                            st.caption(f"💰 本次消耗: {tokens} tokens (${cost:.6f}) | 🔍 使用了搜索增强")
+                        else:
+                            st.caption(f"💰 本次消耗: {tokens} tokens (${cost:.6f})")
             
             st.rerun()
 
