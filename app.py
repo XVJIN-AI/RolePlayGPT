@@ -155,15 +155,35 @@ def init_session_state():
         st.session_state.total_tokens = 0
     if 'total_cost' not in st.session_state:
         st.session_state.total_cost = 0.0
-    if 'client' not in st.session_state:
-        api_key = os.getenv('OPENAI_API_KEY')
-        base_url = os.getenv('OPENAI_BASE_URL')
-        if not api_key or not base_url:
-            st.error("请设置 OPENAI_API_KEY 和 OPENAI_BASE_URL 环境变量")
-            st.stop()
-        st.session_state.client = OpenAI(api_key=api_key, base_url=base_url)
     
-    # MCP搜索相关状态
+    # 每次检查时都重新读取环境变量，确保使用最新的 API key
+    api_key = os.getenv('OPENAI_API_KEY')
+    base_url = os.getenv('OPENAI_BASE_URL')
+    
+    if not api_key or not base_url:
+        st.error("请设置 OPENAI_API_KEY 和 OPENAI_BASE_URL 环境变量")
+        st.stop()
+    
+    # 检查是否需要重新创建 client（环境变量变化或首次创建）
+    need_recreate_client = False
+    if 'client' not in st.session_state:
+        need_recreate_client = True
+    elif 'cached_api_key' not in st.session_state or 'cached_base_url' not in st.session_state:
+        need_recreate_client = True
+    elif st.session_state.cached_api_key != api_key or st.session_state.cached_base_url != base_url:
+        # 环境变量已变化，需要重新创建 client
+        need_recreate_client = True
+        st.info("🔄 检测到 API 配置变化，正在重新初始化...")
+    
+    if need_recreate_client:
+        st.session_state.client = OpenAI(api_key=api_key, base_url=base_url)
+        st.session_state.cached_api_key = api_key
+        st.session_state.cached_base_url = base_url
+        # 如果 MCP 可用，也需要重新创建 mcp_manager（因为它依赖于 client）
+        if MCP_AVAILABLE:
+            st.session_state.mcp_manager = MCPChatManager(st.session_state.client)
+    
+    # MCP搜索相关状态（仅在首次初始化时设置）
     if 'mcp_manager' not in st.session_state and MCP_AVAILABLE:
         st.session_state.mcp_manager = MCPChatManager(st.session_state.client)
     if 'enable_mcp_search' not in st.session_state:
